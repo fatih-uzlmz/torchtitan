@@ -11,6 +11,7 @@ import torch
 import torch._inductor.config
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor.experimental import local_map
 from torch.distributed.tensor import Replicate, Shard
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
@@ -62,6 +63,27 @@ _op_sac_save_list = {
     torch._higher_order_ops.inductor_compiled_code,
 }
 
+class _LocalMapInnerAttention(nn.Module):
+    """Wraps inner_attention with local_map for TP + CP composition."""
+    def __init__(self, inner_attn: nn.Module):
+        super().__init__()
+        self._inner = inner_attn
+        
+        # In Qwen3, TP shards q, k, v on the heads dimension (dim=1)
+        shard_heads = (Shard(1),)
+        
+        # We use local_map to safely convert DTensors to local tensors for the CP hooks.
+        # Addressing @acisseJZhong's question about other args:
+        # By only defining in_placements for the 3 positional args (xq, xk, xv),
+        # local_map will pass kwargs (like attention_mask) through natively without placement checks.
+        self._local_map_fn = local_map(
+            self._inner,
+            out_placements=(shard_heads,), 
+            in_placements=(shard_heads, shard_heads, shard_heads),
+        )
+
+    def forward(self, xq, xk, xv, **kwargs):
+        return self._local_map_fn(xq, xk, xv, **kwargs)
 
 def parallelize_qwen3(
     model: Qwen3Model,
@@ -133,6 +155,15 @@ def parallelize_qwen3(
         )
 
     if parallel_dims.cp_enabled:
+        
+        # Wrapping inner_attention to handle DTensor -> local tensor conversion for CP
+        if parallel_dims.tp_enabled:
+            for block in model.layers.values():
+                # pyrefly: ignore [missing-attribute]
+                block.attention.inner_attention = _LocalMapInnerAttention(
+                    block.attention.inner_attention
+                )
+
         apply_cp_to_attention_module(
             # pyrefly: ignore [missing-attribute, not-callable]
             [block.attention.inner_attention for block in model.layers.values()],
